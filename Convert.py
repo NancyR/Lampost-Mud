@@ -35,9 +35,12 @@ def buildDBMain(pth):
     # everything else up until a newline is reached.
             
     pattern = re.compile('#+[A-Z]+.*') 
-            
-    for flname in os.listdir(pth)[:1]:
-        if flname.endswith('.are'):
+    
+    r_server.delete(nowhereArea)
+    r_server.srem('areas', nowhereArea)
+
+    for flname in os.listdir(pth):
+        if flname.endswith('.are') and flname == 'grove.are':
             areaName = flname[:-4]
             
             with open(os.path.join(pth, flname)) as txtFile:
@@ -51,7 +54,6 @@ def buildDBMain(pth):
                 # #MOBILES, #OBJECTS, etc.
             
                 itemList = re.findall(pattern, fileText)
-        
             
                 # Next, use split to get a set of itemText strings that do 
                 # NOT include the actual pattern but use the pattern to split the
@@ -110,18 +112,36 @@ def buildDBMain(pth):
                 encodeDict(areaKey, areaDict)
                 r_server.sadd('areas', areaKey)
                 
-        for areaKey in r_server.smembers('areas'):
-            json_area = r_server.get(areaKey)
+        # After processing ALL areas, update the rooms with the correct exit key.
+        # During the first phase of the conversion, the rooms have VNUMs that 
+        # represent the adjoining room.  In lampost we want the room to have a key
+        # that represents the database key of the adjoining room.  The global VNUM
+        # dictionary is used for the translation.  Note that a room in one area can
+        # have an adjoining room in another area.
+        
+            for areaKey in r_server.smembers('areas'):
+                json_area = r_server.get(areaKey)
+                
+                if debugMode:
+                    print 'areaKey', areaKey
             
-            areaDict = decoder.decode(json_area)
-            if debugMode:
-                print "area", areaKey, areaDict
-            
-            roomList = areaDict.get('rooms')
-                            
-            for roomKey in roomList:
-                updateExitKeys(roomKey)
-            
+                areaDict = decoder.decode(json_area)
+                roomList = areaDict.get('rooms')
+                
+                convertExits = True
+                if roomList:
+                    roomCount = 0
+                    for roomKey in roomList:
+                        if debugMode:
+                            print 'roomKey', roomKey
+                        roomCount = roomCount + 1
+                        
+                        if convertExits:
+                            convertExits = updateExitKeys(roomKey)
+                
+                    areaDict.update({'next_room_id': roomCount})
+                    encodeDict(areaKey, areaDict)
+
     return
 
 def updateExitKeys(roomKey):
@@ -134,9 +154,12 @@ def updateExitKeys(roomKey):
     updatedExitList = []
     
     for exitWithVnum in exitList:
-    
-        updatedExitEntry = convertVnumToKey(exitWithVnum)
-                
+        updatedExitEntry = convertVnumToKey(exitWithVnum,
+                                            roomKey)
+        
+        if not updatedExitEntry:
+            return False
+        
         updatedExitList.append(updatedExitEntry)
     
     roomDict.update({'exits': updatedExitList})
@@ -146,24 +169,76 @@ def updateExitKeys(roomKey):
     
     encodeDict(roomDBKey, roomDict)
     
-    return   
+    return True
 
-def convertVnumToKey(exitWithVnum):
-    
-    exitVnum = exitWithVnum.get('vnum')
+def convertVnumToKey(exitWithVnum,
+                     roomKey):
     
     updatedExit = exitWithVnum.copy()
-    del updatedExit['vnum']
+
+    exitVnum = exitWithVnum.get('vnum')
+    
+    if not exitVnum:
+        return None
+    
+    if debugMode:
+        print 'exitVnum', exitVnum
         
+    del updatedExit['vnum']
     exitRoomKey = ':'.join(['room', exitVnum])
     actualExitRoom = vnumDict.get(exitRoomKey)
     
+    if not actualExitRoom:
+        actualExitRoom = getNowhereRoomKey(exitVnum,
+                                           roomKey)
+
     updatedExit.update({'destination': actualExitRoom})
         
     return updatedExit
-
-    return 
     
+def getNowhereRoomKey(vnum,
+                      roomKey):
+    json_area = r_server.get(nowhereArea)
+    if json_area:
+        areaDict = decoder.decode(json_area)
+        nextRoomNum = areaDict.get('next_room_id') + 1
+        roomList = areaDict.get('rooms')
+        areaDict.update({'next_room_id': nextRoomNum})
+    else:
+        nextRoomNum = 0
+        if debugMode:
+            print "Creating nowhere"
+        roomList = [] 
+        areaDict = {'name': 'nowhere', 
+                    'owner_id': 'nancy',
+                    'next_room_id': nextRoomNum,
+                    'rooms': roomList}            
+        r_server.sadd('areas', nowhereArea)
+        
+    nextRoomId = str(nextRoomNum)
+    dummyExitRoom = ':'.join(['nowhere', nextRoomId])
+    
+    roomList.append(dummyExitRoom)
+    encodeDict(nowhereArea, areaDict)
+
+    exitDesc = ' '.join(['Dummy exit for vnum', vnum])
+    exitList = [{'dir_name': 'n',
+                'desc': exitDesc,
+                'destination': roomKey}]
+     
+    roomDict = {'title': exitDesc, 
+                'desc': 'Missing exit room',
+                'exits': exitList}
+    
+    nowhereRoomKey = ':'.join(['room', dummyExitRoom])
+    
+    if debugMode:
+        print nowhereRoomKey
+        
+    encodeDict(nowhereRoomKey, roomDict)
+      
+    return dummyExitRoom
+
 def encodeDict(dbKey, dbDict):
     my_json_obj = encoder.encode(dbDict)
     r_server.set(dbKey, my_json_obj)
@@ -281,10 +356,8 @@ def parseOneMobile(areaName,
          
     mobileKey = ':'.join(['mobile', itemKey])
     
-    title, notUsed, remainder = itemText.partition('~')
-    
+    title, notUsed, remainder = itemText.partition('~')  
     desc, notUsed, remainder = remainder.lstrip().partition('~')
-    
     mobileDict = {'title': title, 
                   'desc': desc}
     
@@ -296,6 +369,15 @@ def parseOneArticle(areaName,
                     itemKey, 
                     itemText): 
      
+    articleKey = ':'.join(['article', itemKey])
+    
+    title, notUsed, remainder = itemText.partition('~')  
+    desc, notUsed, remainder = remainder.lstrip().partition('~')
+    articleDict = {'title': title, 
+                   'desc': desc}
+    
+    encodeDict(articleKey, articleDict)
+    
     return       
             
 def parseOneRoom(areaName, 
@@ -357,9 +439,13 @@ def createExitEntry(exitString):
  
 vnumDict = {}
 debugMode = True
+nowhereArea = 'area:nowhere'
 
 if __name__ == '__main__':
     pth = 'C:\Users\Nancy\Documents\merc21/area/'
     buildDBMain(pth)
+    
+  
+
     
   
